@@ -1,7 +1,9 @@
 <?php
+declare(strict_types=1);
 
 namespace Imdb;
 
+use DateInterval;
 use Psr\Log\LoggerInterface;
 use Psr\SimpleCache\CacheInterface;
 
@@ -13,20 +15,11 @@ use Psr\SimpleCache\CacheInterface;
  */
 class Cache implements CacheInterface
 {
-    /**
-     * @var Config
-     */
-    protected $config;
-
-    /**
-     * @var LoggerInterface
-     */
-    protected $logger;
+    protected Config $config;
+    protected LoggerInterface $logger;
 
     /**
      * Cache constructor.
-     * @param Config $config
-     * @param LoggerInterface $logger
      * @throws Exception
      */
     public function __construct(Config $config, LoggerInterface $logger)
@@ -46,14 +39,13 @@ class Cache implements CacheInterface
             throw new Exception("[Cache] Configured cache directory [{$this->config->cachedir}] lacks write permission!");
         }
 
-        // @TODO add a limit on how frequently a purge can occur
         $this->purge();
     }
 
     /**
      * @inheritdoc
      */
-    public function get($key, $default = null)
+    public function get(string $key, mixed $default = null): mixed
     {
         if (!$this->config->usecache) {
             return $default;
@@ -61,36 +53,44 @@ class Cache implements CacheInterface
 
         $cleanKey = $this->sanitiseKey($key);
         $fname = $this->config->cachedir . '/' . $cleanKey;
-        if (!file_exists($fname)) {
+
+        if (!is_file($fname)) {
             $this->logger->debug("[Cache] Cache miss for [$key]");
             return $default;
         }
 
         $this->logger->debug("[Cache] Cache hit for [$key]");
+
         if ($this->config->usezip) {
-            $content = file_get_contents('compress.zlib://' . $fname); // This can read uncompressed files too
-            if (!$content) {
+            $content = @file_get_contents('compress.zlib://' . $fname); // liest auch unkomprimierte Dateien
+            if ($content === false) {
                 return $default;
             }
+
             if ($this->config->converttozip) {
-                @$fp = fopen($fname, "r");
-                $zipchk = fread($fp, 2);
-                fclose($fp);
-                if (!($zipchk[0] == chr(31) && $zipchk[1] == chr(139))) { //checking for zip header
-                    /* converting on access */
-                    file_put_contents('compress.zlib://' . $fname, $content);
+                $fp = @fopen($fname, "r");
+                if ($fp) {
+                    $zipchk = fread($fp, 2) ?: '';
+                    fclose($fp);
+                    // prüfen auf gzip header
+                    if (!(isset($zipchk[0], $zipchk[1]) && $zipchk[0] === chr(31) && $zipchk[1] === chr(139))) {
+                        // beim Zugriff konvertieren
+                        @file_put_contents('compress.zlib://' . $fname, $content);
+                    }
                 }
             }
             return $content;
-        } else { // no zip
-            return file_get_contents($fname);
         }
+
+        $data = @file_get_contents($fname);
+        return ($data === false) ? $default : $data;
     }
 
     /**
      * @inheritdoc
+     * Hinweis: $ttl wird aktuell nicht ausgewertet (Datei-Cache ohne per-Key-Expiry).
      */
-    public function set($key, $value, $ttl = null)
+    public function set(string $key, mixed $value, null|int|DateInterval $ttl = null): bool
     {
         if (!$this->config->storecache) {
             return false;
@@ -99,23 +99,24 @@ class Cache implements CacheInterface
         $cleanKey = $this->sanitiseKey($key);
         $fname = $this->config->cachedir . '/' . $cleanKey;
         $this->logger->debug("[Cache] Writing key [$key] to [$fname]");
+
         if ($this->config->usezip) {
-            $fp = gzopen($fname, "w");
-            gzputs($fp, $value);
+            $fp = @gzopen($fname, "w");
+            if ($fp === false) {
+                return false;
+            }
+            gzputs($fp, (string)$value);
             gzclose($fp);
-        } else { // no zip
-            file_put_contents($fname, $value);
+            return true;
         }
 
-        return true;
+        return @file_put_contents($fname, (string)$value) !== false;
     }
 
     /**
-     * This method looks for files older than the cache_expire set in the
-     * \Imdb\Config and removes them
-     *
+     * Entfernt abgelaufene Dateien anhand von config->cache_expire (Sekunden).
      */
-    public function purge()
+    public function purge(): void
     {
         if (!$this->config->storecache || $this->config->cache_expire == 0) {
             return;
@@ -124,59 +125,99 @@ class Cache implements CacheInterface
         $cacheDir = $this->config->cachedir;
         $this->logger->debug("[Cache] Purging old cache entries");
 
-        $thisdir = dir($cacheDir);
+        $dir = @opendir($cacheDir);
+        if ($dir === false) {
+            return;
+        }
+
         $now = time();
-        while ($file = $thisdir->read()) {
-            if ($file != "." && $file != ".." && $file != ".placeholder") {
-                $fname = $cacheDir . '/' . $file;
-                if (is_dir($fname)) {
-                    continue;
-                }
-                $mod = filemtime($fname);
-                if ($mod && ($now - $mod > $this->config->cache_expire)) {
-                    unlink($fname);
-                }
+        while (($file = readdir($dir)) !== false) {
+            if ($file === "." || $file === ".." || $file === ".placeholder") {
+                continue;
+            }
+            $fname = $cacheDir . '/' . $file;
+            if (is_dir($fname)) {
+                continue;
+            }
+            $mod = @filemtime($fname);
+            if ($mod && ($now - $mod > $this->config->cache_expire)) {
+                @unlink($fname);
             }
         }
-        $thisdir->close();
+        closedir($dir);
     }
 
     /**
      * Replace characters the OS won't like using with the filesystem
      */
-    protected function sanitiseKey($key)
+    protected function sanitiseKey(string $key): string
     {
-        return str_replace(array('/', '\\', '?', '%', '*', ':', '|', '"', '<', '>'), '.', $key);
+        return str_replace(['/', '\\', '?', '%', '*', ':', '|', '"', '<', '>'], '.', $key);
     }
 
-    // Some empty functions so we match the interface. These will never be used
-    public function getMultiple($keys, $default = null)
+    public function getMultiple(iterable $keys, mixed $default = null): iterable
     {
-        return [];
+        $results = [];
+        foreach ($keys as $key) {
+            // $key muss string sein laut PSR
+            $results[$key] = $this->get((string)$key, $default);
+        }
+        return $results;
     }
 
-    public function clear()
+    public function setMultiple(iterable $values, null|int|DateInterval $ttl = null): bool
     {
-        return false;
+        $ok = true;
+        foreach ($values as $key => $value) {
+            $ok = $this->set((string)$key, $value, $ttl) && $ok;
+        }
+        return $ok;
     }
 
-    public function delete($key)
+    public function delete(string $key): bool
     {
-        return false;
+        $cleanKey = $this->sanitiseKey($key);
+        $fname = $this->config->cachedir . '/' . $cleanKey;
+        if (!is_file($fname)) {
+            return true;
+        }
+        return @unlink($fname);
     }
 
-    public function deleteMultiple($keys)
+    public function deleteMultiple(iterable $keys): bool
     {
-        return false;
+        $ok = true;
+        foreach ($keys as $key) {
+            $ok = $this->delete((string)$key) && $ok;
+        }
+        return $ok;
     }
 
-    public function has($key)
+    public function clear(): bool
     {
-        return false;
+        $ok = true;
+        $dir = @opendir($this->config->cachedir);
+        if ($dir === false) {
+            return false;
+        }
+        while (($file = readdir($dir)) !== false) {
+            if ($file === "." || $file === ".." || $file === ".placeholder") {
+                continue;
+            }
+            $fname = $this->config->cachedir . '/' . $file;
+            if (is_dir($fname)) {
+                continue;
+            }
+            $ok = @unlink($fname) && $ok;
+        }
+        closedir($dir);
+        return $ok;
     }
 
-    public function setMultiple($values, $ttl = null)
+    public function has(string $key): bool
     {
-        return false;
+        $cleanKey = $this->sanitiseKey($key);
+        $fname = $this->config->cachedir . '/' . $cleanKey;
+        return is_file($fname);
     }
 }
